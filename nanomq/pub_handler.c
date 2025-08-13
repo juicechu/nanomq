@@ -87,6 +87,12 @@ static void  print_hex(
 static uint32_t append_bytes_with_type(
     nng_msg *msg, uint8_t type, uint8_t *content, uint32_t len);
 static void inline handle_pub_retain(nano_work *work, char *topic);
+static char *str_replace(char* string, const char* substr, const char* replacement);
+static int topic_count(const char *topic);
+static void topic_queue_free(char **topic_queue);
+static char **topic_parse(const char *topic);
+static char *repub_topic_replace(const char *topic, const char *from_topic);
+
 
 void
 init_pipe_content(struct pipe_content *pipe_ct)
@@ -171,7 +177,7 @@ cmp_int(int value_checked, int value_seted, rule_cmp_type type)
 			filter = false;
 		}
 		break;
-	
+
 	default:
 		break;
 	}
@@ -971,10 +977,17 @@ rule_engine_insert_sql(nano_work *work)
 				char *dest = cJSON_PrintUnformatted(jso);
 				repub_t *repub = rules[i].repub;
 
-				nano_client_publish(repub->sock, repub->topic, dest, strlen(dest), 0, NULL);
-				log_debug("%s", repub->topic);
+                // exist ${topic} or ${topic[0]} placeholder
+                char *topic = strdup(repub->topic);
+                if (strstr(topic, "${topic") != NULL) {
+	                char *from_topic = pp->var_header.publish.topic_name.body;
+                    topic = repub_topic_replace(topic, from_topic);
+                }
+				nano_client_publish(repub->sock, topic, dest, strlen(dest), 0, NULL);
+				log_debug("%s", topic);
 				log_debug("%s", dest);
 
+                free(topic);
 				cJSON_free(dest);
 				cJSON_Delete(jso);
 			}
@@ -1003,7 +1016,7 @@ rule_engine_insert_sql(nano_work *work)
 						int   rc      = sqlite3_exec(
 						           sdb, ret, 0, 0, &err_msg);
 						// FIXME: solve in a more
-						// elegant way 
+						// elegant way
 						if (rc != SQLITE_OK) {
 							// fprintf(stderr, "SQL error: num %d %s\n",
 							//     rc, err_msg);
@@ -1023,7 +1036,7 @@ rule_engine_insert_sql(nano_work *work)
 					nng_mtx_unlock(rule_mutex);
 				}
 
-				
+
 
 				log_debug("%s", key);
 				log_debug("%s", value);
@@ -1102,7 +1115,7 @@ rule_engine_insert_sql(nano_work *work)
 					nng_mtx_unlock(rule_mutex);
 				}
 
-				
+
 
 				log_debug("%s", key);
 				log_debug("%s", value);
@@ -1336,13 +1349,13 @@ rule_engine_insert_sql(nano_work *work)
 
 #endif
 /**
- * 
+ *
 	only deal with locale publishing
 	client - broker - client + bridge - broker - client
 	broker - bridge is not included
 	@is_event indicates this is not a common pub msg
 	it is either a SYS or retain msg
- * 
+ *
  */
 
 reason_code
@@ -2018,4 +2031,157 @@ check_msg_exp(nng_msg *msg, property *prop)
 		}
 	}
 	return true;
+}
+
+// fork from https://github.com/irl/la-cucina/blob/master/str_replace.c
+static char*
+str_replace(char* string, const char* substr, const char* replacement) {
+	char* tok = NULL;
+	char* newstr = NULL;
+	char* oldstr = NULL;
+	int   oldstr_len = 0;
+	int   substr_len = 0;
+	int   replacement_len = 0;
+
+	newstr = strdup(string);
+	substr_len = strlen(substr);
+	replacement_len = strlen(replacement);
+
+	if (substr == NULL || replacement == NULL) {
+		return newstr;
+	}
+
+	if (strcmp(substr, replacement) == 0) {
+        // substr == replacement
+		return newstr;
+	}
+
+	while ((tok = strstr(newstr, substr))) {
+		oldstr = newstr;
+		oldstr_len = strlen(oldstr);
+		newstr = (char*)malloc(sizeof(char) * (oldstr_len - substr_len + replacement_len + 1));
+
+		if (newstr == NULL) {
+			free(oldstr);
+			return NULL;
+		}
+
+		memcpy(newstr, oldstr, tok - oldstr);
+		memcpy(newstr + (tok - oldstr), replacement, replacement_len);
+		memcpy(newstr + (tok - oldstr) + replacement_len, tok + substr_len, oldstr_len - substr_len - (tok - oldstr));
+		memset(newstr + oldstr_len - substr_len + replacement_len, 0, 1);
+
+		free(oldstr);
+	}
+
+	free(string);
+
+	return newstr;
+}
+
+static int
+topic_count(const char *topic)
+{
+	int         cnt = 0;
+	const char *t   = topic;
+
+	while (t) {
+		// log_info("%s", t);
+		t = strchr(t, '/');
+		cnt++;
+		if (t == NULL) {
+			break;
+		}
+		t++;
+	}
+
+	return cnt;
+}
+
+static void
+topic_queue_free(char **topic_queue)
+{
+	char * t  = NULL;
+	char **tq = topic_queue;
+
+	while (*topic_queue) {
+		t = *topic_queue;
+		topic_queue++;
+		free(t);
+		t = NULL;
+	}
+
+	if (tq) {
+		free(tq);
+	}
+}
+
+static char **
+topic_parse(const char *topic)
+{
+	if (topic == NULL) {
+		// log_err("topic is NULL");
+		return NULL;
+	}
+
+	int         row   = 0;
+	int         len   = 2;
+	const char *b_pos = topic;
+	char *      pos   = NULL;
+
+	int cnt = topic_count(topic);
+
+	// Here we will get (cnt + 1) memory, one for NULL end
+	char **topic_queue = (char **) malloc(sizeof(char *) * (cnt + 1));
+
+	while ((pos = strchr(b_pos, '/')) != NULL) {
+
+		len              = pos - b_pos + 1;
+		topic_queue[row] = (char *) malloc(sizeof(char) * len);
+		memcpy(topic_queue[row], b_pos, (len - 1));
+		topic_queue[row][len - 1] = '\0';
+		b_pos                     = pos + 1;
+		row++;
+	}
+
+	len = strlen(b_pos);
+
+	topic_queue[row] = (char *) malloc(sizeof(char) * (len + 1));
+	memcpy(topic_queue[row], b_pos, (len));
+	topic_queue[row][len] = '\0';
+	topic_queue[++row]    = NULL;
+
+	return topic_queue;
+}
+
+/**
+ * replace topic for republish rule
+ *
+ * @param src
+ * @param dest
+ * @param src_len
+ * @return
+ */
+static char
+*repub_topic_replace(const char *topic, const char *from_topic)
+{
+    char *new_topic = NULL;
+    new_topic = strdup(topic);
+    new_topic = str_replace(new_topic, "${topic}", from_topic);
+
+    char **w_q = topic_parse(from_topic);
+    char **wq_free = w_q;
+    int i = 0;
+
+    while (*w_q != NULL) {
+        char *tmp = malloc(32);
+        snprintf(tmp, 32, "${topic[%d]}", i);
+        new_topic = str_replace(new_topic, tmp, *w_q);
+        w_q++;
+        i++;
+        free(tmp);
+    }
+
+    topic_queue_free(wq_free);
+    return new_topic;
 }
